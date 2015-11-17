@@ -1,0 +1,179 @@
+---
+title: "PML assignment on Human Activity Recognition"
+author: "BK"
+date: "Saturday, November 14, 2015"
+output: html_document
+---
+
+##Objective:  
+To determine if a person is exercising in the correct manner/ with correct movements, by assessing readings from the accelerometers used. Being part of a course assignment, we are further required to,  
+* demonstrate our ability to extract meaningful information from raw data inputs,  
+* show how we've attempted to eliminate undesired noise in the data,  
+* attempt to reduce out-of-sample errors by using appropriate data slicing techniques (like Cross Validation) and  
+* describe how we've picked a modeling approach that minimizes out-of-sample errors  
+
+
+```{r, echo=FALSE, cache=TRUE, message =FALSE, warning=FALSE}
+#Prep - loading libraries
+library(caret)
+library(parallel)
+library(foreach)
+library(doParallel)
+
+set.seed(1235)
+
+```
+
+##Extracting meaningful information from raw data:  
+Exploratory analysis shows that this is a good sized data set with 160 columns. Some of which are not predictors for the following reasons,  
+* user name or time stamps (7 such columns)  
+* columns with NA (67 such columns)  
+* columns with no or little variance (34 such columns)  
+  
+After removing these, we're left with 53 columns of data, including the "classe" predicted variable that we will use to train/ test the model. 
+
+##Data management:  
+Using the Caret package's CreateDataPartition function, we split 75% of the given training data (in the file "pml-training.csv") into data for training the model.This split is done on the "classe" column.  
+The remaining 25% is used for model selection using out-of-sample error as the measure.   
+The given testing data (in the file "pml-testing.csv") is untouched till after model selection. We only use this test data for the submission section of the assignment.  
+  
+```{r, echo=FALSE, cache=TRUE, message =FALSE, warning=FALSE}
+#Prep - loading libraries & data + data manipulation
+train <- read.csv("pml-training.csv")
+trainTrim <- train[, colSums(is.na(train)) < 14409]
+trainTrim <- trainTrim[,-c(1:7)]
+
+test <- read.csv("pml-testing.csv")
+testTrim <- test[, colSums(is.na(train)) < 14409]
+testTrim <- testTrim[,-c(1:7)]
+
+inTrain <- createDataPartition(y=trainTrim$classe,p=0.75, list=FALSE)
+training <- trainTrim[inTrain,]; testing <- trainTrim[-inTrain,]
+
+remZeroVar <- nearZeroVar(training)
+training <- training[-remZeroVar]
+testing <- testing[-remZeroVar]
+testTrim <- testTrim[-remZeroVar]
+```
+
+##Eliminating undesired noise:  
+90% of the variance in the data set is explained by just 18 principal components. This reduction from 52 to 18 predictors shows substantial corelation between predictors that would have caused undesirable "noise". This transformation to a reduced number of weighted predictors was done using Principal Component Analysis.  
+
+##Data slicing:  
+We know that we need to guard against overfitted models that perform well only on the training data because such a model would be useless for real world usage. To prevent this, two different approaches were tried. One was Cross Validation, with 10 folds and 10 repeats. But from a review of subject literature, we see that while Cross Validation shows less bias, it has more variance. So, a natural counter choice was bootstrapping with a 100 samples. We see from the same subject literature that bootstrapping has the opposite characteristic of low variance but more bias, thus balancing out the Cross Validation approach.  
+
+##Training a model:  
+First, we know that this is a classification problem where we're trying to identify categorical class labels. Hence, we need to build a classification model. In contrast, a prediction model that predicts a continuously valued function is not a good fit. Next, after reviewing course material, we pick two different classification options that show promise for further evaluation - Boosting and Random Forest. Slide 12 of course material for Boosting shows these to be the most common winners of prediction contests, like Kaggle.  
+Note: The evaluations below cover 2 data slicing schemes (Cross validation & Bootstrap) and two model types (Boosting and Random Forest ). While we are aware that we should test all of these as 2x2 = 4 combinations, these have only been tested in two combinations Cross validation + Boosting and Bootstrap + Random Forest. This is so because the out-of-sample error rate of the second trial (Bootstrap + Random Forest) was a low 3% and no further optimization was deemed neccessary.  
+
+
+###Cross Validation + Boosting:  
+Model details, are provided in R's output below and are not repeated here (like the Gradient Boosted Model package was chosen, it picked the best of 150 different iterations in which variables like the number of trees  (150), interaction depth  (3), shrinkage  (0.1) , observations per node (10) were optimized). 
+The data used here was put together using the "repeatedcv" function with 10 folds and 10 repeats. 
+The confusion matrix was generated from the testing data that was set aside, as explained above.  
+
+```{r, echo=FALSE, cache=TRUE, message =FALSE, warning=FALSE}
+#gbm model + prediction
+cl <- makeCluster(3)
+registerDoParallel(cl)
+
+preProc <- preProcess(training,method="pca",thresh=0.90)
+trainProc <- predict(preProc, training)
+testProc <- predict(preProc, testing)
+testTrim <- predict(preProc, testTrim)
+
+
+testProc <- testProc[,c(2:19,1)]
+trainProc <- trainProc[,c(2:19,1)]
+testTrim <- testTrim[,c(2:19,1)]
+testTrim2 <- testTrim[,-19]
+testTrim2$classe <- as.factor(rep("",20))
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, verboseIter =TRUE, classProbs = TRUE)
+modelFit <- train(classe ~ .,method="gbm",data=trainProc,trControl = fitControl,verbose = FALSE)
+modelFit$finalModel
+predictions <- predict(modelFit,newdata=testProc)
+predictions2 <- predict(modelFit,newdata=testTrim2)
+stopCluster(cl)
+
+confusionMatrix(predictions,testProc$classe)
+OOS.accuracy <- (sum(predictions == testProc$classe)/length(predictions))*100
+OOS.error <- 100- OOS.accuracy
+```
+
+
+
+```{r, echo=FALSE, cache=TRUE}
+#charts
+#par(mfrow=c(2,2))
+#plot(modelFit)
+#plot(modelFit, metric = "Kappa")
+#plot(modelFit, plotType = "level")
+#resampleHist(modelFit)
+```
+
+###Bootstrapping + Random Forest  
+Again, all the relevant model details, like the number of trees (500) are provided in R's output below. In this case, the call to the trained model also produced the confusion matrix, which in this case is using training data. 
+This training data was the output of the "boot" data slicing function with 100 samples.  
+
+```{r, echo=FALSE, cache=TRUE}
+# boot + rf
+cl <- makeCluster(3)
+registerDoParallel(cl)
+
+#preProc <- preProcess(training,method="pca",thresh=0.90)
+#trainProc <- predict(preProc, training)
+#testProc <- predict(preProc, testing)
+#testTrim <- predict(preProc, testTrim)
+
+
+#dim(testProc)
+#names(testProc)
+#names(trainProc)
+#names(testTrim)
+#dim(testTrim)
+#testProc <- testProc[,c(2:19,1)]
+#trainProc <- trainProc[,c(2:19,1)]
+#testTrim <- testTrim[,c(2:19,1)]
+testTrim2.rf <- testTrim[,-19]
+testTrim2.rf$classe <- as.factor(rep("",20))
+
+fitControl2 <- trainControl(method="boot", number=100)
+modelFit.rf <- train(classe ~ .,method="rf",data=trainProc,trControl = fitControl2,verbose = FALSE)
+modelFit.rf$finalModel
+stopCluster(cl)
+```
+
+```{r, echo=F, cache=TRUE}
+predictions.rf <- predict(modelFit.rf,newdata=testProc)
+#predictions.rf
+```
+
+```{r, echo=F, cache=TRUE}
+predictions2.rf <- predict(modelFit.rf,newdata=testTrim2.rf)
+#as.character(predictions2.rf)
+```
+
+```{r, echo=F, cache=TRUE}
+OOS.accuracy.rf <- (sum(predictions.rf == testProc$classe)/length(predictions.rf))*100
+```
+
+```{r, echo=F, cache=TRUE}
+OOS.error.rf <- 100- OOS.accuracy.rf
+```
+
+```{r, echo=FALSE, cache=TRUE}
+#charts
+#par(mfrow=c(2,2))
+#plot(modelFit.rf)
+#plot(modelFit.rf, metric = "Kappa")
+#plot(modelFit.rf, plotType = "level")
+#resampleHist(modelFit.rf)
+```
+##Picking a model:  
+The assignment requires us to make a model choice that minimizes out of sample error. The data used for out of sample error estimation is the testing data cleaved out of the training data, as explained in the "Data management" section above. Using this testing data provides us an apple to apple comparison of the models using the same data. Here is the comparison of the two models:  
+Out of sample error rate for Gradient Boosted model with Cross Validated samples is:`r round(OOS.error,2)`%  
+Out of sample error rate for Random Forest model with Bootstrapped samples is:`r round(OOS.error.rf,2)`%  
+  
+Clearly, the Random Forest model with Bootstrapped samples is the better approach. The output it produces for the test file of 20 observations is also given below.  
+`r as.character(predictions2.rf)` 
+
